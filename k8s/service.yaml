@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: tomcatdeploy
+  labels:
+    app: tomcatdeploy
+spec:
+  type: ClusterIP
+  selector:
+    app: tomcatdeploy
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

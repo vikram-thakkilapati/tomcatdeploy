@@ -1,0 +1,140 @@
+name: Build, Wiz scan, deploy to EKS
+
+on:
+  push:
+    branches:
+      - main
+      - claude/quirky-brown-s6mouu   # temporary: lets this branch deploy before merge
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # OIDC to AWS
+  contents: read
+
+concurrency:
+  group: eks-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+  EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
+  WIZ_IAC_POLICY: ${{ vars.WIZ_IAC_POLICY || 'Default IaC policy' }}
+  WIZ_VULN_POLICY: ${{ vars.WIZ_VULN_POLICY || 'Default vulnerabilities policy' }}
+
+jobs:
+  preflight:
+    name: Check configuration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify required secrets and variables
+        env:
+          WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
+          WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
+          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+        run: |
+          missing=()
+          for s in WIZ_CLIENT_ID WIZ_CLIENT_SECRET AWS_ROLE_ARN; do
+            [ -n "${!s}" ] || missing+=("secret $s")
+          done
+          for v in AWS_REGION ECR_REPOSITORY EKS_CLUSTER_NAME; do
+            [ -n "${!v}" ] || missing+=("variable $v")
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            for m in "${missing[@]}"; do echo "::error::Missing repository $m (Settings → Secrets and variables → Actions)"; done
+            exit 1
+          fi
+          echo "All required configuration present."
+
+  build-and-scan:
+    name: Build and Wiz scan
+    needs: preflight
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    env:
+      WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
+      WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Maven build and test
+        run: mvn -B package
+
+      - name: Download and authenticate Wiz CLI
+        run: |
+          curl -sSfL -o wizcli https://downloads.wiz.io/wizcli/latest/wizcli-linux-amd64
+          chmod +x wizcli
+          ./wizcli auth --id "$WIZ_CLIENT_ID" --secret "$WIZ_CLIENT_SECRET"
+
+      - name: Wiz IaC scan (Dockerfile + k8s manifests)
+        run: ./wizcli iac scan --path . --policy "$WIZ_IAC_POLICY"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build image
+        id: meta
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/${ECR_REPOSITORY}:${GITHUB_SHA}"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          docker build -t "$IMAGE" .
+
+      - name: Wiz image scan (blocks on policy failure)
+        run: ./wizcli docker scan --image "$IMAGE" --dockerfile Dockerfile --policy "$WIZ_VULN_POLICY"
+
+      - name: Push image and tag it in Wiz
+        if: github.event_name != 'pull_request'
+        run: |
+          docker push "$IMAGE"
+          ./wizcli docker tag --image "$IMAGE"
+
+  deploy:
+    name: Deploy to EKS
+    needs: build-and-scan
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy manifests
+        env:
+          IMAGE: ${{ needs.build-and-scan.outputs.image }}
+        run: |
+          aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
+          cd k8s
+          kustomize edit set image "tomcatdeploy=$IMAGE"
+          kubectl apply -k .
+          kubectl -n tomcatdeploy rollout status deployment/tomcatdeploy --timeout=300s
+
+      - name: Show endpoint
+        run: |
+          for i in $(seq 1 30); do
+            host=$(kubectl -n tomcatdeploy get ingress tomcatdeploy -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+            [ -n "$host" ] && break
+            sleep 10
+          done
+          echo "App URL: http://${host:-<ALB still provisioning>}/" | tee -a "$GITHUB_STEP_SUMMARY"
