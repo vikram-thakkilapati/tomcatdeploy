@@ -1,0 +1,30 @@
+# Helm values for the Wiz Kubernetes Integration chart
+# (https://wiz-sec.github.io/charts, chart: wiz-kubernetes-integration).
+# Secrets are NOT stored here: create them first with wiz/install.sh.
+# Key names follow the chart's documented layout; confirm against
+# `helm show values wiz-sec/wiz-kubernetes-integration` for your chart version.
+
+global:
+  wizApiToken:
+    secret:
+      create: false
+      name: wiz-api-token        # keys: clientId, clientToken
+
+wiz-kubernetes-connector:
+  enabled: true                  # agentless posture scanning of the cluster
+  autoCreateConnector:
+    connectorName: tomcatdeploy-eks
+    clusterFlavor: EKS
+
+wiz-sensor:
+  enabled: true                  # runtime threat detection (DaemonSet)
+  imagePullSecret:
+    create: false
+    name: wiz-sensor-pull        # docker-registry secret for wizio.azurecr.io
+
+wiz-admission-controller:
+  enabled: true                  # enforce Wiz policies at deploy time
+  opaWebhook:
+    enabled: true
+  imageIntegrityWebhook:
+    enabled: false

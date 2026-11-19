@@ -1,0 +1,70 @@
+name: Build, Wiz scan, deploy to EKS
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # OIDC to AWS
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}          # e.g. tomcatdeploy
+  EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
+  WIZ_IAC_POLICY: ${{ vars.WIZ_IAC_POLICY || 'Default IaC policy' }}
+  WIZ_VULN_POLICY: ${{ vars.WIZ_VULN_POLICY || 'Default vulnerabilities policy' }}
+  WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
+  WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
+
+jobs:
+  build-scan-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download and authenticate Wiz CLI
+        run: |
+          curl -sSfL -o wizcli https://downloads.wiz.io/wizcli/latest/wizcli-linux-amd64
+          chmod +x wizcli
+          ./wizcli auth --id "$WIZ_CLIENT_ID" --secret "$WIZ_CLIENT_SECRET"
+
+      - name: Wiz IaC scan (Dockerfile + k8s manifests)
+        run: ./wizcli iac scan --path . --policy "$WIZ_IAC_POLICY"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build image
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/${ECR_REPOSITORY}:${GITHUB_SHA}"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          docker build -t "$IMAGE" .
+
+      - name: Wiz image scan (blocks on policy failure)
+        run: ./wizcli docker scan --image "$IMAGE" --dockerfile Dockerfile --policy "$WIZ_VULN_POLICY"
+
+      - name: Push image and tag it in Wiz
+        if: github.event_name != 'pull_request'
+        run: |
+          docker push "$IMAGE"
+          ./wizcli docker tag --image "$IMAGE"
+
+      - name: Deploy to EKS
+        if: github.event_name != 'pull_request'
+        run: |
+          aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
+          cd k8s
+          kustomize edit set image "tomcatdeploy=$IMAGE"
+          kubectl apply -k .
+          kubectl -n tomcatdeploy rollout status deployment/tomcatdeploy --timeout=300s
